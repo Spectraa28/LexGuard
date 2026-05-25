@@ -3,4 +3,4 @@ application-secrets.yml
 *.env
 .env
 *.yml
-.yml
+.ymlingestion-service/src/main/resources/application.yml
