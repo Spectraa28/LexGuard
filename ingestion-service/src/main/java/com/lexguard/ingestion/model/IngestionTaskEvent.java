@@ -23,6 +23,6 @@ public record IngestionTaskEvent(
     ) {
 
         public static IngestionTaskEvent create(UUID documentID, String storageKey, String tenantId){
-            return new IngestionTaskEvent(UUID.randomUUID(), documentID, storageKey, tenantId, Instant.now())
+            return new IngestionTaskEvent(UUID.randomUUID(), documentID, storageKey, tenantId, Instant.now());
         }
 }

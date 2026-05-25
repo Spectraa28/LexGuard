@@ -1,0 +1,6 @@
+application-local.yml
+application-secrets.yml
+*.env
+.env
+*.yml
+.yml
