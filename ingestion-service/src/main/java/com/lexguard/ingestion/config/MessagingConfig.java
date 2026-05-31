@@ -29,14 +29,14 @@ public class MessagingConfig {
     }
 
     @Bean 
-    public  Queue documentParsingQueue() {
+    public  Queue documentPARSEDQueue() {
         return new Queue(QUEUE_NAME,true);
     }
 
     @Bean
-    public Binding binding(Queue documentParsingQueue, DirectExchange ingestionExchange){
+    public Binding binding(Queue documentPARSEDQueue, DirectExchange ingestionExchange){
         return BindingBuilder
-                    .bind(documentParsingQueue)
+                    .bind(documentPARSEDQueue)
                     .to(ingestionExchange)
                     .with(ROUTING_KEY);
     }
