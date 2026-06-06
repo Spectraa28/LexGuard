@@ -34,7 +34,7 @@ public class TransactionalOutboxService {
             String payload = objectMapper.writeValueAsString(event);
 
             //Forces the Pennding initial state via the entity factory method
-            OutboxMessage message = OutboxMessage.createPending("DocumentIngested",payload );
+            OutboxMessage message = OutboxMessage.createPending("DocumentIngested",payload , event.documentId().toString() );
 
             outboxMessageRepository.save(message);
 

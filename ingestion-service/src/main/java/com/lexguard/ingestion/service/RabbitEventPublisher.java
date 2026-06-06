@@ -37,6 +37,7 @@ public class RabbitEventPublisher {
                 .withBody(outboxMessage.getPayload().getBytes(StandardCharsets.UTF_8))
                 .setContentType(MessageProperties.CONTENT_TYPE_JSON)
                 .setMessageId(outboxMessage.getId().toString())
+                .setCorrelationId((outboxMessage.getDocumentId()))
                 .build();
 
     CorrelationData correlationData = new CorrelationData(outboxMessage.getId().toString());

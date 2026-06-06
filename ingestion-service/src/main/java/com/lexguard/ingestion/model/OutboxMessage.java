@@ -24,6 +24,8 @@ public class OutboxMessage {
         FAILED
     }
 
+    
+
     @Id
     private UUID id;
 
@@ -34,6 +36,9 @@ public class OutboxMessage {
     @JdbcTypeCode(SqlTypes.JSON)
     @Column(nullable = false, updatable = false)
     private String payload;
+
+    @Column(nullable = false, updatable = false)
+    private String documentId; // New field
 
     @Enumerated(EnumType.STRING)
     @Column(nullable = false)
@@ -50,16 +55,17 @@ public class OutboxMessage {
     // Required by JPA
     protected OutboxMessage() {}
 
-    private OutboxMessage(String eventType, String payload) {
+    private OutboxMessage(String eventType, String payload, String documentId) {
         this.id = UUID.randomUUID();
         this.eventType = eventType;
         this.payload = payload;
+        this.documentId = documentId;
         this.status = OutboxStatus.PENDING;
         this.retryCount = 0;
     }
 
-    public static OutboxMessage createPending(String eventType, String payload) {
-        return new OutboxMessage(eventType, payload);
+    public static OutboxMessage createPending(String eventType, String payload, String documentId) {
+        return new OutboxMessage(eventType, payload, documentId);
     }
 
     @PrePersist
@@ -89,9 +95,12 @@ public class OutboxMessage {
         }
     }
 
+    
+
     public UUID getId() { return id; }
     public String getEventType() { return eventType; }
     public String getPayload() { return payload; }
+    public String getDocumentId() { return documentId; }
     public OutboxStatus getStatus() { return status; }
     public int getRetryCount() { return retryCount; }
     public Instant getCreatedAt() { return createdAt; }
