@@ -1,10 +1,17 @@
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional ,Dict, Any
 from sqlalchemy.orm import Session
-from sqlalchemy import text
+from sqlalchemy import text ,create_engine
+from sentence_transformers import SentenceTransformer
+from config import settings
+
+MODEL_NAME = "all-MiniLM-L6-v2"
+embedding_model = SentenceTransformer(MODEL_NAME)
+engine = create_engine(settings.DATABASE_URL, pool_pre_ping=True)
 
 @dataclass
 class SearchResult:
+    document_id: str
     content: str
     page_number: Optional[int]
     distance: float
@@ -24,6 +31,7 @@ def retrieve_relevant_chunks(
             SELECT CAST(:query_vector AS vector) AS q_vec
         )
         SELECT 
+            d.id AS document_id,
             dc.content,
             dc.page_number,
             (ce.embedding <=> query_ctx.q_vec) AS distance
@@ -49,9 +57,43 @@ def retrieve_relevant_chunks(
     
     return [
         SearchResult(
+            document_id=str(row.document_id),
             content=row.content,
             page_number=row.page_number,
             distance=row.distance
         )
         for row in result_set
     ]
+    
+
+
+def query_documents(query_text: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """
+    The Orchestrator: Bridges the FastAPI endpoint and the database search.
+    Handles text embedding, session management, and score translation.
+    """
+    # Mismatch 2 fix: Convert raw API text into a 384-dimensional vector
+    query_vector = embedding_model.encode(query_text).tolist()
+    
+    # Execute the database search
+    with Session(engine) as session:
+        raw_results = retrieve_relevant_chunks(
+            session=session,
+            query_vector=query_vector,
+            top_k=limit
+        )
+        
+    # Mismatch 3 fix: Translate distance to score, and format for Pydantic
+    formatted_matches = []
+    for result in raw_results:
+        # For cosine distance, similarity score is (1.0 - distance)
+        similarity_score = 1.0 - result.distance
+        
+        formatted_matches.append({
+            "document_id": result.document_id,
+            "content": result.content,
+            "score": round(similarity_score, 4),
+            "page_number": result.page_number
+        })
+        
+    return formatted_matches

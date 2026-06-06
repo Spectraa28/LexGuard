@@ -7,115 +7,143 @@ A Legal Inference and AI Observability Control Plane. LexGuard ingests legal doc
 ## Architecture Overview
 
 ```
-HTTP Upload (Spring Boot)
+HTTP Upload (Spring Boot :8080)
     └── Cloudflare R2 (raw PDF storage)
     └── PostgreSQL (document metadata + outbox)
     └── RabbitMQ (async event bus)
             └── Python Embedding Worker
                     └── Unstructured.io (PDF parsing)
-                    └── SentenceTransformers (vector generation)
-                    └── pgvector (HNSW similarity index)
+                    └── SentenceTransformers all-MiniLM-L6-v2 (vector generation)
+                    └── pgvector HNSW index (similarity search)
+            └── Python Supervisor (ghost document recovery)
+            └── FastAPI RAG API (:8000)
 ```
 
 ---
 
-## Local Development Setup
+## Verified Pipeline
+
+Upload a legal PDF → Spring Boot stores to R2 and writes a transactional outbox event → RabbitMQ relay delivers the message → Python worker parses, chunks, and embeds the document → pgvector stores 384-dimensional vectors under HNSW → FastAPI `/query` endpoint returns semantically ranked chunks.
+
+A healthy single-pass run completes at `version = 5`, reflecting five atomic state transitions. The supervisor sweep detects documents stuck in any non-terminal state beyond the timeout threshold and rolls them back to the last safe checkpoint automatically.
+
+Tested end-to-end on ISO 27001:2022. RAG query returning real chunks at cosine similarity score `0.6233`. Supervisor rollback verified: `EMBEDDING → PARSED` at `version = 6`.
+
+---
+
+## Quick Start (Docker Compose)
 
 ### Prerequisites
 
 - Docker and Docker Compose
-- Java 21
-- Maven
-- Python 3.10+
-- Miniconda or virtualenv
+- Cloudflare R2 bucket with API credentials
 
-### Step 1 — Boot the infrastructure
+### Step 1 — Configure environment
 
-The `ingestion-service` Docker Compose file starts PostgreSQL (with the pgvector extension), RabbitMQ, and their management UIs in a single command.
+Create a `.env` file at the project root:
 
-```bash
-cd ingestion-service
-docker compose up -d
+```env
+R2_ACCOUNT_ID=your_cloudflare_account_id
+R2_ACCESS_KEY=your_r2_access_key
+R2_SECRET_KEY=your_r2_secret_key
+R2_BUCKET_NAME=your_bucket_name
 ```
 
-PostgreSQL will be available at `localhost:5432` and RabbitMQ management UI at `localhost:15672` (guest/guest).
+### Step 2 — Build and start all services
 
-### Step 2 — Start the Spring Boot ingestion service
+```bash
+docker compose build
+docker compose up
+```
 
-Flyway will automatically apply all migrations (V1 through V5) on startup, creating the full schema including the pgvector HNSW index and the `document_status` enum.
+This starts six services: `postgres`, `rabbitmq`, `ingestion-service`, `embedding-worker`, `supervisor`, and `api`. Flyway migrations run automatically on ingestion service startup, applying V1 through V6.
+
+Wait for:
+- `lexguard-ingestion` — `Started LexGuardIngestionApplication`
+- `lexguard-api` — `Uvicorn running on http://0.0.0.0:8000`
+- `lexguard-worker` — `Embedding Worker successfully started`
+
+### Step 3 — Upload a document
+
+```bash
+curl -X POST http://localhost:8080/api/v1/documents \
+  -H "X-Tenant-ID: tenant-001" \
+  -F "file=@your_contract.pdf;type=application/pdf"
+```
+
+Response:
+```json
+{
+  "documentId": "...",
+  "status": "UPLOADED",
+  "message": "Document successfully stored and queued for ML processing."
+}
+```
+
+### Step 4 — Query the document
+
+```bash
+curl -X POST http://localhost:8000/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "what are the access control requirements", "limit": 3}'
+```
+
+### Step 5 — Verify pipeline state
+
+```bash
+docker exec lexguard-postgres psql -U admin -d lexguard \
+  -c "SELECT id, status, version, updated_at FROM documents ORDER BY created_at DESC LIMIT 5;"
+```
+
+A completed document shows `status = COMPLETED` and `version = 5`.
+
+---
+
+## Local Development (Alternative)
+
+### Prerequisites
+
+- Java 21, Maven
+- Python 3.10+
+- PostgreSQL 16 with pgvector extension
+- RabbitMQ
+
+### Spring Boot ingestion service
 
 ```bash
 cd ingestion-service
 ./mvnw spring-boot:run
 ```
 
-The ingestion API will be available at `http://localhost:8080`.
+Copy `src/main/resources/application-example.yml` to `application.yml` and fill in your database, RabbitMQ, and R2 credentials. Flyway applies all migrations automatically on startup.
 
-### Step 3 — Start the Python embedding worker
-
-The worker connects to the same PostgreSQL instance and RabbitMQ broker defined in the Docker Compose. Install dependencies and run with unbuffered output so the full traceback is visible on any exception.
+### Python worker and API
 
 ```bash
 cd embedding-worker
 pip install -r requirements.txt
-python -u worker.py
+python -u worker.py        # embedding worker
+python supervisor.py       # supervisor sweep
+uvicorn main:app --port 8000  # RAG API
 ```
 
-### Environment Configuration
-
-Copy `ingestion-service/src/main/resources/application-example.yml` to `application.yml` and fill in the required values. The embedding worker reads its configuration from environment variables defined in `embedding-worker/config.py`. An example `.env` structure for the worker:
-
-```env
-DATABASE_URL=postgresql://postgres:password@localhost:5432/lexguard
-RABBITMQ_HOST=localhost
-RABBITMQ_PORT=5672
-RABBITMQ_USER=guest
-RABBITMQ_PASSWORD=guest
-R2_ACCOUNT_ID=your_cloudflare_account_id
-R2_ACCESS_KEY_ID=your_r2_access_key
-R2_SECRET_ACCESS_KEY=your_r2_secret_key
-R2_BUCKET_NAME=your_bucket_name
-```
-
-### Uploading a document
-
-Once all three services are running, upload a PDF through the ingestion API:
-
-```bash
-curl -X POST http://localhost:8080/api/v1/documents/upload \
-  -F "file=@your_contract.pdf" \
-  -F "tenantId=tenant-001" \
-  -F "fileName=your_contract.pdf"
-```
-
-The worker will log the full pipeline progression and the document will reach `COMPLETED` status in the database.
-
-### Verifying a successful run
-
-```sql
-SELECT id, status, version, updated_at
-FROM documents
-ORDER BY created_at DESC
-LIMIT 5;
-```
-
-A healthy single-pass run completes at `version = 5`, reflecting five atomic state transitions across the Spring Boot parsing phase and the Python embedding phase.
+Configure via environment variables matching `config.py`. The worker reads `DATABASE_URL`, `RABBITMQ_HOST`, `RABBITMQ_PORT`, `RABBITMQ_USER`, `RABBITMQ_PASS`, `RABBITMQ_QUEUE`, and the R2 credentials.
 
 ---
 
-## Phase 1 — Async Ingestion (Sessions 1–3)
+## Phase 1 — Async Ingestion Pipeline (Sessions 1–4)
 
 ### Transactional Outbox Pattern (Session 1)
 
-The Spring Boot service never publishes directly to RabbitMQ. Every document upload writes to the `documents` table and the `outbox_messages` table inside a single database transaction. A scheduled relay process reads unpublished outbox rows and publishes them to RabbitMQ, marking each row `PUBLISHED` only after the broker confirms receipt. This guarantees that no message is lost even if the broker is temporarily unavailable at upload time.
+The Spring Boot service never publishes directly to RabbitMQ. Every document upload atomically writes to both the `documents` table and the `outbox_messages` table inside a single database transaction. A scheduled relay process polls unpublished outbox rows using `FOR UPDATE SKIP LOCKED` and publishes them to RabbitMQ, marking each row `PUBLISHED` only after the broker confirms receipt via synchronous publisher confirms.
 
-The upload endpoint returns `202 Accepted` immediately, confirming the document is durably stored before any asynchronous processing begins.
+This guarantees no message is lost even if the broker is temporarily unavailable at upload time. The upload endpoint returns `202 Accepted` immediately, confirming the document is durably stored before any asynchronous processing begins.
 
 ### Schema and Migrations (Session 2)
 
-Flyway-managed schema with five verified migrations. Core tables:
+Flyway-managed schema with six verified migrations (V1–V6). Core tables:
 
-`documents` — tenant-isolated metadata with a six-state PostgreSQL enum (`UPLOADED → PARSED → EMBEDDING → EMBEDDED → COMPLETED → FAILED`), an `is_latest` flag for contract version routing, and a `version` integer column for optimistic locking.
+`documents` — tenant-isolated metadata with a six-state PostgreSQL enum (`UPLOADED → PARSED → EMBEDDED → EMBEDDING → COMPLETED → FAILED`), an `is_latest` flag for contract version routing, and a `version` integer column for optimistic locking.
 
 `document_lineage` — append-only parent/child adjacency list with a unique constraint on `parent_document_id` enforcing single-child amendment chains.
 
@@ -123,33 +151,31 @@ Flyway-managed schema with five verified migrations. Core tables:
 
 `chunk_embeddings` — separated vector table with a `(chunk_id, model_name)` unique constraint enabling zero-downtime embedding model upgrades. HNSW index tuned at `m=16, ef_construction=128` for high-recall legal retrieval.
 
+`outbox_events` — Python-side outbox table with `server_default` enforced at the DDL layer, ensuring the `PENDING` initial state is guaranteed even for out-of-band inserts from the Java relay.
+
 ### Python Embedding Worker (Session 2)
 
-State-driven checkpoint pipeline consuming from RabbitMQ:
+State-driven checkpoint pipeline consuming from RabbitMQ with `prefetch_count=1` and `heartbeat=600` to survive heavy CPU-bound embedding runs:
 
 `models.py` — SQLAlchemy 2.0 declarative ORM with pgvector integration and `version_id_col` wired to the `documents.version` column for automatic optimistic locking.
 
 `processor.py` — resumable pipeline with two independently checkpointed phases (parse, embed), distinguishing transient failures (R2 network errors, database deadlocks — NACK with requeue) from terminal failures (corrupted PDF, invalid model — mark FAILED, ACK to drain the message).
 
-`worker.py` — pika consumer with `prefetch_count=1`, `heartbeat=600`, and explicit ACK/NACK routing mapping processor signals to RabbitMQ protocol.
+`worker.py` — pika consumer with explicit ACK/NACK routing mapping processor signals to RabbitMQ protocol.
 
 ### State Machine Hardening and Optimistic Locking (Session 3)
 
-Added `EMBEDDING` as an explicit distributed lock state written durably to PostgreSQL before the `SentenceTransformer` computation begins. This allows a future supervisor sweep to distinguish an actively processing worker from a crashed one by checking both the status column and the `updated_at` timestamp together.
+`EMBEDDING` is an explicit distributed lock state written durably to PostgreSQL before the `SentenceTransformer` computation begins. This allows the supervisor sweep to distinguish an actively processing worker from a crashed one by checking both the status column and the `updated_at` timestamp together.
 
-Added a `version` integer column (Flyway V5) to the `documents` table, defaulting to 1. The `version_id_col` mapper in SQLAlchemy automatically appends a version predicate to every update. If a supervisor sweep re-queues a document while the original worker is still computing, the slow worker's final commit raises `StaleDataError`, which is caught and handled as `SKIP_SUPERSEDED` — the worker rolls back all pending chunk embeddings and ACKs the message without crashing or polluting the vector store.
+The `version` integer column (Flyway V5) enables optimistic locking via SQLAlchemy's `version_id_col`. If a supervisor sweep re-queues a document while the original worker is still computing, the slow worker's final commit raises `StaleDataError`, which is caught and handled as `SKIP_SUPERSEDED` — the worker rolls back all pending chunk embeddings and ACKs the message without crashing or polluting the vector store.
 
-### RAG Retrieval Layer (Session 3)
+### RAG Retrieval and Supervisor Sweep (Session 4)
 
-`retrieval.py` exposes a `retrieve_relevant_chunks` function that performs cosine similarity search against the embedded vector store. The query uses a CTE to cast the query vector exactly once, joins across `chunk_embeddings`, `document_chunks`, and `documents`, and enforces two mandatory business filters: `documents.status = 'COMPLETED'` to exclude in-progress documents and `documents.is_latest = true` to exclude superseded contract versions. A configurable distance threshold (default `0.5`) prevents semantically irrelevant chunks from reaching the generation layer. Results are returned as typed `SearchResult` dataclasses containing `content`, `page_number`, and `distance`.
+`retrieval.py` exposes a `query_documents` orchestrator that embeds the raw query text using `all-MiniLM-L6-v2`, executes a CTE-optimised cosine similarity search via pgvector, and returns typed `SearchResult` dataclasses. The query enforces two mandatory business filters: `documents.status = 'COMPLETED'` to exclude in-progress documents and `documents.is_latest = true` to exclude superseded contract versions. A configurable distance threshold (default `0.5`) acts as a noise gate. Cosine distance is converted to similarity score via `1.0 - distance` before returning to the client.
 
-The retrieval function is verified against a live ingested document and correctly returns zero results for queries outside the document's semantic domain, confirming the threshold filter is functioning as a noise gate rather than a bug.
+`supervisor.py` runs as a standalone background process on a configurable sweep interval. It detects documents stuck in any non-terminal state beyond the timeout threshold and applies a staged rollback map: `EMBEDDING → PARSED` (wipes potentially corrupted chunk data via cascade delete), `PARSED → UPLOADED` (forces full re-parse), `EMBEDDED` and `UPLOADED` remain unchanged (durable checkpoints requiring only a fresh outbox event). Each document is processed in a fully isolated SQLAlchemy session with `FOR UPDATE SKIP LOCKED` to prevent multiple supervisor instances from double-processing the same document. The sweep interval is configured at a strict fraction of the timeout threshold to avoid the temporal aliasing race where a healthy worker's document is swept mid-flight.
 
----
-
-## Phase 2 — Guardrailed Inference (Upcoming)
-
-Phase 2 will introduce the inference control plane in front of the retrieval layer: Llama Guard for input and output screening, a SemanticCache backed by Faiss and Redis for repeat-query deduplication, a DeepSeek generation model, and an append-only audit log for full observability of every inference decision. The `/query` FastAPI endpoint will be wired in this phase.
+`main.py` exposes a FastAPI `/query` endpoint with Pydantic request validation, dataclass-to-dict conversion, and two-layer exception handling distinguishing database connection failures from general pipeline errors.
 
 ---
 
@@ -157,17 +183,29 @@ Phase 2 will introduce the inference control plane in front of the retrieval lay
 
 ```
 LexGuard/
-├── ingestion-service/          # Spring Boot 3.5 / Java 21 async ingestion API
-│   ├── src/main/java/          # Controllers, services, outbox relay, R2 storage
+├── docker-compose.yml              # Unified 6-service compose (project root)
+├── .env                            # R2 credentials (not committed)
+├── ingestion-service/              # Spring Boot 3.5 / Java 21 async ingestion API
+│   ├── Dockerfile
+│   ├── src/main/java/              # Controllers, services, outbox relay, R2 storage
 │   └── src/main/resources/
 │       ├── application.yml
 │       ├── application-example.yml
-│       └── db/migration/       # V1–V5 Flyway migrations
-└── embedding-worker/           # Python 3.10 async embedding pipeline
-    ├── worker.py               # pika RabbitMQ consumer
-    ├── processor.py            # State-driven parse + embed pipeline
-    ├── models.py               # SQLAlchemy 2.0 ORM with pgvector
-    ├── retrieval.py            # pgvector cosine similarity search
-    ├── config.py               # Environment-based configuration
+│       └── db/migration/           # V1–V6 Flyway migrations
+└── embedding-worker/               # Python 3.12 async embedding pipeline
+    ├── Dockerfile
+    ├── worker.py                   # pika RabbitMQ consumer
+    ├── processor.py                # State-driven parse + embed pipeline
+    ├── supervisor.py               # Ghost document recovery sweep
+    ├── models.py                   # SQLAlchemy 2.0 ORM with pgvector + OutboxEvent
+    ├── retrieval.py                # pgvector cosine similarity search + orchestrator
+    ├── main.py                     # FastAPI /query endpoint
+    ├── config.py                   # Environment-based configuration
     └── requirements.txt
 ```
+
+---
+
+## Phase 2 — Active Observability Layer (Upcoming)
+
+Phase 2 will instrument every pipeline boundary with correlation IDs, expose a Prometheus `/metrics` endpoint with query latency histograms and supervisor recovery counters, and add an active `/health` endpoint returning real-time pipeline state including stuck document counts, last sweep time, and queue depth.

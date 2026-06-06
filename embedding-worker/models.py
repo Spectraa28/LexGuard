@@ -89,3 +89,24 @@ class ChunkEmbedding(Base):
     )
 
     chunk: Mapped["DocumentChunk"] = relationship(back_populates="embeddings")
+    
+
+class OutboxEvent(Base):
+    __tablename__ = "outbox_events"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    document_id: Mapped[str] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), 
+        nullable=False
+    )
+    status: Mapped[str] = mapped_column(
+        String(50), 
+        default="PENDING", 
+        server_default=text("'PENDING'"), 
+        nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), 
+        nullable=False, 
+        server_default=text("CURRENT_TIMESTAMP")
+    )
