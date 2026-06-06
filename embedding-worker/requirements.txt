@@ -1,0 +1,23 @@
+# RabbitMQ messaging client
+pika==1.4.1
+
+# Database connection and ORM
+psycopg2-binary==2.9.12
+SQLAlchemy==2.0.50
+pgvector==0.4.2
+
+# Machine Learning & Embeddings
+torch==2.4.1
+sentence-transformers==3.0.1
+# Environment variables
+python-dotenv==1.2.2
+pydantic-settings>=2.14.0
+
+# Storage (Cloudflare R2)
+boto3==1.34.110
+
+# Document PARSED
+uvicorn==0.29.0
+fastapi==0.111.0
+
+unstructured[all-docs]==0.18.32

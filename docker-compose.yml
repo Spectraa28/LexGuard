@@ -1,0 +1,104 @@
+version: '3.8'
+
+services:
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: lexguard-postgres
+    ports:
+      - "5435:5432"
+    environment:
+      POSTGRES_DB: lexguard
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d lexguard"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: lexguard-rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  ingestion-service:
+    build: ./ingestion-service
+    container_name: lexguard-ingestion
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/lexguard
+      SPRING_DATASOURCE_USERNAME: admin
+      SPRING_DATASOURCE_PASSWORD: password
+      SPRING_RABBITMQ_HOST: rabbitmq
+      SPRING_RABBITMQ_PORT: 5672
+      SPRING_RABBITMQ_USERNAME: guest
+      SPRING_RABBITMQ_PASSWORD: guest
+      CLOUDFLARE_R2_ACCOUNT_ID: ${R2_ACCOUNT_ID}
+      CLOUDFLARE_R2_ACCESS_KEY: ${R2_ACCESS_KEY}
+      CLOUDFLARE_R2_SECRET_KEY: ${R2_SECRET_KEY}
+      CLOUDFLARE_R2_BUCKET_NAME: ${R2_BUCKET_NAME}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  embedding-worker:
+    build: ./embedding-worker
+    container_name: lexguard-worker
+    environment:
+      DATABASE_URL: postgresql+psycopg2://admin:password@postgres:5432/lexguard
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: guest
+      RABBITMQ_PASS: guest
+      RABBITMQ_QUEUE: lexguard.document.parsing.queue
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  supervisor:
+    build: ./embedding-worker
+    container_name: lexguard-supervisor
+    command: python supervisor.py
+    environment:
+      DATABASE_URL: postgresql+psycopg2://admin:password@postgres:5432/lexguard
+      SWEEP_INTERVAL_SECONDS: 60
+      STUCK_TIMEOUT_SECONDS: 300
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ingestion-service:
+        condition: service_started
+
+  api:
+    build: ./embedding-worker
+    container_name: lexguard-api
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+psycopg2://admin:password@postgres:5432/lexguard
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:

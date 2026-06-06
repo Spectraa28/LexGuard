@@ -1,262 +1,211 @@
-# LexGuard — Ingestion Service (Phase 1)
+# LexGuard
 
-> Asynchronous document ingestion pipeline for the LexGuard Legal Inference and AI Observability Control Plane.
-
-## What This Service Does
-
-Legal and compliance teams upload PDF contracts through the Next.js frontend. This Spring Boot service accepts those uploads and guarantees they reach the downstream Python ML workers without data loss — even under peak morning load spikes or infrastructure failures.
-
-The core architectural guarantee: **a single ACID transaction writes both the document record and the outbox event**. If the application crashes between the database write and the RabbitMQ publish, the Transactional Outbox Pattern ensures the message is never lost.
+A Legal Inference and AI Observability Control Plane. LexGuard ingests legal documents, chunks and embeds them into a pgvector store, and exposes a guardrailed RAG inference layer for legal question answering with full audit traceability.
 
 ---
 
-## Architecture
+## Architecture Overview
 
 ```
-Next.js Frontend
-      │
-      │  POST /api/v1/documents (multipart/form-data)
-      ▼
-Spring Boot Ingestion Service
-      │
-      ├─ 1. Stream PDF → Cloudflare R2            (non-transactional, no DB connection held)
-      │
-      ├─ 2. ACID dual-write (single transaction)
-      │       ├─ INSERT documents (status: UPLOADED)
-      │       └─ INSERT outbox_messages (status: PENDING)
-      │
-      └─ 3. Background OutboxMessageRelay (@Scheduled)
-              ├─ SELECT ... FOR UPDATE SKIP LOCKED  (multi-pod safe)
-              ├─ Publish to RabbitMQ with publisher confirms
-              └─ UPDATE outbox_messages (status: PUBLISHED | FAILED)
-                        │
-                        ▼
-              RabbitMQ: lexguard.document.parsing.queue
-                        │
-                        ▼
-              Phase 2: Python ML Workers (OCR → Chunking → PgVector)
-```
-
-### Key Design Decisions
-
-**Transaction boundary after S3 upload.** Holding a database connection open during a network stream exhausts the Hikari pool under concurrent load. The PostgreSQL connection only opens after R2 confirms the upload.
-
-**Transactional Outbox Pattern.** Eliminates the dual-write problem between object storage and the message broker. The outbox event shares the same database transaction as the document record — both commit or neither does.
-
-**`FOR UPDATE SKIP LOCKED`.** The relay uses a native PostgreSQL query with row-level locking. If two pods sweep the outbox simultaneously, they receive different batches without lock collisions or duplicate RabbitMQ publishes.
-
-**Synchronous publisher confirms.** The relay blocks up to 5 seconds for a broker ACK before marking a message as a transient failure. After 5 retries the message is marked `FAILED` to prevent a corrupted payload from blocking healthy uploads indefinitely.
-
----
-
-## Tech Stack
-
-| Component | Technology |
-|---|---|
-| Web Framework | Spring Boot 3.5.0 (Java 21) |
-| Message Broker | RabbitMQ 3 (AMQP) |
-| Database | PostgreSQL 15 + JPA/Hibernate |
-| Object Storage | Cloudflare R2 (AWS SDK v2) |
-| Scheduler | Spring `@Scheduled` + `@EnableScheduling` |
-| Serialization | Jackson with `JavaTimeModule` (ISO-8601 timestamps) |
-
----
-
-## Project Structure
-
-```
-ingestion-service/
-└── src/main/java/com/lexguard/ingestion/
-    ├── LexGuardIngestionApplication.java
-    ├── config/
-    │   ├── MessagingConfig.java          # RabbitMQ topology (exchange, queue, binding, converter)
-    │   └── StorageConfig.java            # Cloudflare R2 S3 client bean
-    ├── controller/
-    │   ├── DocumentIngestionController.java
-    │   └── advice/GlobalExceptionHandler.java
-    ├── model/
-    │   ├── Document.java                 # Primary domain entity (UPLOADED → PROCESSING → COMPLETED)
-    │   ├── DocumentUploadRequest.java    # Ephemeral input DTO with Jakarta validation
-    │   ├── IngestionTaskEvent.java       # Immutable domain event (Java record)
-    │   └── OutboxMessage.java            # Transactional outbox entity with state machine
-    ├── repository/
-    │   ├── DocumentRepository.java
-    │   └── OutboxMessageRepository.java  # Native SKIP LOCKED query
-    └── service/
-        ├── IngestionOrchestrator.java    # Coordinates S3 upload and persistence boundary
-        ├── RabbitEventPublisher.java     # Raw AMQP publish with synchronous confirms
-        ├── S3StorageProvider.java        # Streams multipart file to R2, returns StorageResult
-        ├── TransactionalOutboxService.java  # Propagation.MANDATORY — chains to parent transaction
-        ├── OutboxMessageRelay.java       # @Scheduled sweeper with retry logic
-        └── persistence/
-            └── DocumentPersistenceService.java  # @Transactional boundary, crosses AOP proxy
+HTTP Upload (Spring Boot :8080)
+    └── Cloudflare R2 (raw PDF storage)
+    └── PostgreSQL (document metadata + outbox)
+    └── RabbitMQ (async event bus)
+            └── Python Embedding Worker
+                    └── Unstructured.io (PDF parsing)
+                    └── SentenceTransformers all-MiniLM-L6-v2 (vector generation)
+                    └── pgvector HNSW index (similarity search)
+            └── Python Supervisor (ghost document recovery)
+            └── FastAPI RAG API (:8000)
 ```
 
 ---
 
-## Local Setup
+## Verified Pipeline
+
+Upload a legal PDF → Spring Boot stores to R2 and writes a transactional outbox event → RabbitMQ relay delivers the message → Python worker parses, chunks, and embeds the document → pgvector stores 384-dimensional vectors under HNSW → FastAPI `/query` endpoint returns semantically ranked chunks.
+
+A healthy single-pass run completes at `version = 5`, reflecting five atomic state transitions. The supervisor sweep detects documents stuck in any non-terminal state beyond the timeout threshold and rolls them back to the last safe checkpoint automatically.
+
+Tested end-to-end on ISO 27001:2022. RAG query returning real chunks at cosine similarity score `0.6233`. Supervisor rollback verified: `EMBEDDING → PARSED` at `version = 6`.
+
+---
+
+## Quick Start (Docker Compose)
 
 ### Prerequisites
 
-- Java 21
-- Maven 3.9+
-- Docker Desktop
+- Docker and Docker Compose
+- Cloudflare R2 bucket with API credentials
 
-### 1. Start Infrastructure
+### Step 1 — Configure environment
+
+Create a `.env` file at the project root:
+
+```env
+R2_ACCOUNT_ID=your_cloudflare_account_id
+R2_ACCESS_KEY=your_r2_access_key
+R2_SECRET_KEY=your_r2_secret_key
+R2_BUCKET_NAME=your_bucket_name
+```
+
+### Step 2 — Build and start all services
 
 ```bash
-docker compose up -d
+docker compose build
+docker compose up
 ```
 
-This starts PostgreSQL (port 5432) and RabbitMQ (port 5672, management UI on 15672).
+This starts six services: `postgres`, `rabbitmq`, `ingestion-service`, `embedding-worker`, `supervisor`, and `api`. Flyway migrations run automatically on ingestion service startup, applying V1 through V6.
 
-### 2. Configure the Application
+Wait for:
+- `lexguard-ingestion` — `Started LexGuardIngestionApplication`
+- `lexguard-api` — `Uvicorn running on http://0.0.0.0:8000`
+- `lexguard-worker` — `Embedding Worker successfully started`
 
-Create `ingestion-service/src/main/resources/application-local.yml` — this file is gitignored and must never be committed:
+### Step 3 — Upload a document
 
-```yaml
-spring:
-  datasource:
-    url: jdbc:postgresql://localhost:5432/lexguard
-    username: your_db_user
-    password: your_db_password
-  jpa:
-    hibernate:
-      ddl-auto: update   # use 'validate' + Flyway in production
-  rabbitmq:
-    host: localhost
-    port: 5672
-    username: guest
-    password: guest
-    publisher-confirm-type: correlated
-
-cloudflare:
-  r2:
-    account-id: your_account_id
-    access-key: your_r2_access_key
-    secret-key: your_r2_secret_key
-    bucket-name: your_bucket_name
+```bash
+curl -X POST http://localhost:8080/api/v1/documents \
+  -H "X-Tenant-ID: tenant-001" \
+  -F "file=@your_contract.pdf;type=application/pdf"
 ```
 
-The base `application.yml` in the repo contains only environment variable placeholders. All secrets go in `application-local.yml` or as environment variables.
+Response:
+```json
+{
+  "documentId": "...",
+  "status": "UPLOADED",
+  "message": "Document successfully stored and queued for ML processing."
+}
+```
 
-### 3. Run the Service
+### Step 4 — Query the document
+
+```bash
+curl -X POST http://localhost:8000/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "what are the access control requirements", "limit": 3}'
+```
+
+### Step 5 — Verify pipeline state
+
+```bash
+docker exec lexguard-postgres psql -U admin -d lexguard \
+  -c "SELECT id, status, version, updated_at FROM documents ORDER BY created_at DESC LIMIT 5;"
+```
+
+A completed document shows `status = COMPLETED` and `version = 5`.
+
+---
+
+## Local Development (Alternative)
+
+### Prerequisites
+
+- Java 21, Maven
+- Python 3.10+
+- PostgreSQL 16 with pgvector extension
+- RabbitMQ
+
+### Spring Boot ingestion service
 
 ```bash
 cd ingestion-service
-mvn spring-boot:run -Dspring-boot.run.profiles=local
+./mvnw spring-boot:run
 ```
 
-The service starts on `http://localhost:8080`.
+Copy `src/main/resources/application-example.yml` to `application.yml` and fill in your database, RabbitMQ, and R2 credentials. Flyway applies all migrations automatically on startup.
 
-### 4. Verify Startup
+### Python worker and API
 
 ```bash
-curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/api/v1/documents
-# Expected: 405 (Method Not Allowed — POST endpoint is registered)
+cd embedding-worker
+pip install -r requirements.txt
+python -u worker.py        # embedding worker
+python supervisor.py       # supervisor sweep
+uvicorn main:app --port 8000  # RAG API
+```
+
+Configure via environment variables matching `config.py`. The worker reads `DATABASE_URL`, `RABBITMQ_HOST`, `RABBITMQ_PORT`, `RABBITMQ_USER`, `RABBITMQ_PASS`, `RABBITMQ_QUEUE`, and the R2 credentials.
+
+---
+
+## Phase 1 — Async Ingestion Pipeline (Sessions 1–4)
+
+### Transactional Outbox Pattern (Session 1)
+
+The Spring Boot service never publishes directly to RabbitMQ. Every document upload atomically writes to both the `documents` table and the `outbox_messages` table inside a single database transaction. A scheduled relay process polls unpublished outbox rows using `FOR UPDATE SKIP LOCKED` and publishes them to RabbitMQ, marking each row `PUBLISHED` only after the broker confirms receipt via synchronous publisher confirms.
+
+This guarantees no message is lost even if the broker is temporarily unavailable at upload time. The upload endpoint returns `202 Accepted` immediately, confirming the document is durably stored before any asynchronous processing begins.
+
+### Schema and Migrations (Session 2)
+
+Flyway-managed schema with six verified migrations (V1–V6). Core tables:
+
+`documents` — tenant-isolated metadata with a six-state PostgreSQL enum (`UPLOADED → PARSED → EMBEDDED → EMBEDDING → COMPLETED → FAILED`), an `is_latest` flag for contract version routing, and a `version` integer column for optimistic locking.
+
+`document_lineage` — append-only parent/child adjacency list with a unique constraint on `parent_document_id` enforcing single-child amendment chains.
+
+`document_chunks` — layout-aware text fragments with page number and chunk type metadata for legal citation traceability.
+
+`chunk_embeddings` — separated vector table with a `(chunk_id, model_name)` unique constraint enabling zero-downtime embedding model upgrades. HNSW index tuned at `m=16, ef_construction=128` for high-recall legal retrieval.
+
+`outbox_events` — Python-side outbox table with `server_default` enforced at the DDL layer, ensuring the `PENDING` initial state is guaranteed even for out-of-band inserts from the Java relay.
+
+### Python Embedding Worker (Session 2)
+
+State-driven checkpoint pipeline consuming from RabbitMQ with `prefetch_count=1` and `heartbeat=600` to survive heavy CPU-bound embedding runs:
+
+`models.py` — SQLAlchemy 2.0 declarative ORM with pgvector integration and `version_id_col` wired to the `documents.version` column for automatic optimistic locking.
+
+`processor.py` — resumable pipeline with two independently checkpointed phases (parse, embed), distinguishing transient failures (R2 network errors, database deadlocks — NACK with requeue) from terminal failures (corrupted PDF, invalid model — mark FAILED, ACK to drain the message).
+
+`worker.py` — pika consumer with explicit ACK/NACK routing mapping processor signals to RabbitMQ protocol.
+
+### State Machine Hardening and Optimistic Locking (Session 3)
+
+`EMBEDDING` is an explicit distributed lock state written durably to PostgreSQL before the `SentenceTransformer` computation begins. This allows the supervisor sweep to distinguish an actively processing worker from a crashed one by checking both the status column and the `updated_at` timestamp together.
+
+The `version` integer column (Flyway V5) enables optimistic locking via SQLAlchemy's `version_id_col`. If a supervisor sweep re-queues a document while the original worker is still computing, the slow worker's final commit raises `StaleDataError`, which is caught and handled as `SKIP_SUPERSEDED` — the worker rolls back all pending chunk embeddings and ACKs the message without crashing or polluting the vector store.
+
+### RAG Retrieval and Supervisor Sweep (Session 4)
+
+`retrieval.py` exposes a `query_documents` orchestrator that embeds the raw query text using `all-MiniLM-L6-v2`, executes a CTE-optimised cosine similarity search via pgvector, and returns typed `SearchResult` dataclasses. The query enforces two mandatory business filters: `documents.status = 'COMPLETED'` to exclude in-progress documents and `documents.is_latest = true` to exclude superseded contract versions. A configurable distance threshold (default `0.5`) acts as a noise gate. Cosine distance is converted to similarity score via `1.0 - distance` before returning to the client.
+
+`supervisor.py` runs as a standalone background process on a configurable sweep interval. It detects documents stuck in any non-terminal state beyond the timeout threshold and applies a staged rollback map: `EMBEDDING → PARSED` (wipes potentially corrupted chunk data via cascade delete), `PARSED → UPLOADED` (forces full re-parse), `EMBEDDED` and `UPLOADED` remain unchanged (durable checkpoints requiring only a fresh outbox event). Each document is processed in a fully isolated SQLAlchemy session with `FOR UPDATE SKIP LOCKED` to prevent multiple supervisor instances from double-processing the same document. The sweep interval is configured at a strict fraction of the timeout threshold to avoid the temporal aliasing race where a healthy worker's document is swept mid-flight.
+
+`main.py` exposes a FastAPI `/query` endpoint with Pydantic request validation, dataclass-to-dict conversion, and two-layer exception handling distinguishing database connection failures from general pipeline errors.
+
+---
+
+## Repository Structure
+
+```
+LexGuard/
+├── docker-compose.yml              # Unified 6-service compose (project root)
+├── .env                            # R2 credentials (not committed)
+├── ingestion-service/              # Spring Boot 3.5 / Java 21 async ingestion API
+│   ├── Dockerfile
+│   ├── src/main/java/              # Controllers, services, outbox relay, R2 storage
+│   └── src/main/resources/
+│       ├── application.yml
+│       ├── application-example.yml
+│       └── db/migration/           # V1–V6 Flyway migrations
+└── embedding-worker/               # Python 3.12 async embedding pipeline
+    ├── Dockerfile
+    ├── worker.py                   # pika RabbitMQ consumer
+    ├── processor.py                # State-driven parse + embed pipeline
+    ├── supervisor.py               # Ghost document recovery sweep
+    ├── models.py                   # SQLAlchemy 2.0 ORM with pgvector + OutboxEvent
+    ├── retrieval.py                # pgvector cosine similarity search + orchestrator
+    ├── main.py                     # FastAPI /query endpoint
+    ├── config.py                   # Environment-based configuration
+    └── requirements.txt
 ```
 
 ---
 
-## Testing the Pipeline
+## Phase 2 — Active Observability Layer (Upcoming)
 
-### Smoke Test — Single Upload
-
-```bash
-curl -v -X POST http://localhost:8080/api/v1/documents \
-  -H "X-Tenant-ID: tenant-test-001" \
-  -F "file=@/path/to/your/test.pdf;type=application/pdf"
-```
-
-Expected response:
-
-```json
-{
-  "documentId": "9cabba37-0b64-4486-a58a-66f15d0df095",
-  "status": "UPLOADED",
-  "message": "Document successfully stored and queued for ML processing."
-}
-```
-
-HTTP status: `202 Accepted`
-
-### Verify the Pipeline End-to-End
-
-**1. Document landed in PostgreSQL:**
-```bash
-docker exec -it lexguard-postgres psql -U your_db_user -d lexguard \
-  -c "SELECT id, tenant_id, original_file_name, status, created_at FROM documents ORDER BY created_at DESC LIMIT 5;"
-```
-
-**2. Outbox event published:**
-```bash
-docker exec -it lexguard-postgres psql -U your_db_user -d lexguard \
-  -c "SELECT id, event_type, status, retry_count FROM outbox_messages ORDER BY created_at DESC LIMIT 5;"
-```
-
-The `status` column should show `PUBLISHED` and `retry_count` should be `0` within 5 seconds of the upload.
-
-**3. RabbitMQ received the message:**
-
-Open `http://localhost:15672` (guest/guest) → Queues → `lexguard.document.parsing.queue`. The message count increments with each upload.
-
----
-
-## API Reference
-
-### POST `/api/v1/documents`
-
-Accepts a PDF upload and queues it for asynchronous ML processing.
-
-**Request**
-
-| Part | Type | Required | Description |
-|---|---|---|---|
-| `file` | `multipart/form-data` | Yes | PDF binary (application/pdf only) |
-| `X-Tenant-ID` | Header | Yes | Tenant identifier for data isolation |
-
-**Response — 202 Accepted**
-
-```json
-{
-  "documentId": "uuid",
-  "status": "UPLOADED",
-  "message": "Document successfully stored and queued for ML processing."
-}
-```
-
-**Response — 503 Service Unavailable**
-
-Returned when Cloudflare R2 is unreachable.
-
-**Response — 400 Bad Request**
-
-Returned when the file is missing, empty, or not a PDF.
-
----
-
-## Known Limitations and Production TODOs
-
-**Schema migrations:** `ddl-auto: update` is used for local development. Production requires Flyway with explicit migration scripts including the partial index for the outbox relay:
-
-```sql
-CREATE INDEX idx_outbox_pending ON outbox_messages (created_at) WHERE status = 'PENDING';
-```
-
-**Magic number validation:** The content-type check on upload uses the client-supplied MIME header. Production should inspect the first 4 bytes of the binary for the `%PDF` signature (`25 50 44 46`) or use Apache Tika.
-
-**Quorum queues:** The RabbitMQ queue is declared as classic durable. Production clusters should use quorum queues (`x-queue-type: quorum`) for HA via Raft replication.
-
-**Flyway dependency:** Add `spring-boot-starter-flyway` to `pom.xml` before production deployment.
-
----
-
-## Document Processing Lifecycle
-
-```
-UPLOADED     →    PROCESSING    →    COMPLETED
-   │                                     
-   └──────────────────────────────→    FAILED
-```
-
-`UPLOADED` is set by this service. All subsequent transitions are owned by the Phase 2 Python ML workers via webhook or return queue callback.
+Phase 2 will instrument every pipeline boundary with correlation IDs, expose a Prometheus `/metrics` endpoint with query latency histograms and supervisor recovery counters, and add an active `/health` endpoint returning real-time pipeline state including stuck document counts, last sweep time, and queue depth.

@@ -1,0 +1,1 @@
+CREATE INDEX idx_documents_tenant_active ON documents (tenant_id, is_latest);

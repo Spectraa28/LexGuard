@@ -2,5 +2,22 @@ application-local.yml
 application-secrets.yml
 *.env
 .env
-*.yml
-.ymlingestion-service/src/main/resources/application.yml
+ingestion-service/src/main/resources/application.yml
+
+
+# Spring Boot / Java
+target/
+*.class
+*.jar
+*.war
+
+# Environments / Secrets
+.env
+application-secret.properties
+application-local.properties
+
+
+__pycache__/
+*.pyc
+.env
+embedding-worker/__pycache__/

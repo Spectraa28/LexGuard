@@ -1,0 +1,33 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: lexguard-ingestion
+    
+  datasource:
+    url: jdbc:postgresql://localhost:5432/lexguard
+    username: your_db_user
+    password: your_db_password
+    
+  jpa:
+    hibernate:
+      ddl-auto: validate
+      
+  flyway:
+    baseline-on-migrate: true
+    baseline-version: 1
+    
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: guest
+    password: guest
+    publisher-confirm-type: correlated
+
+cloudflare:
+  r2:
+    account-id: your_account_id
+    access-key: your_r2_access_key
+    secret-key: your_r2_secret_key
+    bucket-name: your_bucket_name
