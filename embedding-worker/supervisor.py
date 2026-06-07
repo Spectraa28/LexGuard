@@ -3,14 +3,15 @@ import time
 import uuid 
 import logging
 from datetime import datetime , timezone , timedelta
-from sqlalchemy import create_engine , select
+from sqlalchemy import create_engine , select ,text
 from sqlalchemy.orm import Session, Mapped, mapped_column, exc
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.exc import StaleDataError
 
 from models import Document , DocumentStatus , OutboxEvent ,Base
+from  telemetry import LAST_SUPERVISOR_SWEEP_TIMESTAMP , setup_logging
 
-logging.basicConfig(level=logging.INFO)
+setup_logging(level=logging.INFO)
 logger = logging.getLogger("supervisor")
 
 SWEEP_INTERVAL = int(os.getenv("SWEEP_INTERVAL_SECONDS","60"))
@@ -67,14 +68,13 @@ def requeue_document(engine,doc_id:str,threshold_time: datetime):
             session.rollback()
             
 def run_sweep(engine):
-    """Main supervisor loop"""
-    
-    logger.info(f"Starting supervisor sweep . Inverval : {SWEEP_INTERVAL}s ,  timeout: {TIMEOUT_THRESHOLD}s")
-    
+    """Main supervisor loop with corrected session scoping."""
+    logger.info(f"Starting supervisor sweep. Interval: {SWEEP_INTERVAL}s, timeout: {TIMEOUT_THRESHOLD}s")
     while True:
         try:
             threshold_time = datetime.now(timezone.utc) - timedelta(seconds=TIMEOUT_THRESHOLD)
             
+            # The session context now encompasses both retrieval and heartbeat upsert
             with Session(engine) as session:
                 candidate_ids = session.scalars(
                     select(Document.id)
@@ -89,16 +89,29 @@ def run_sweep(engine):
                         DocumentStatus.EMBEDDING
                     ]))
                 ).all()
+
+                if candidate_ids:
+                    logger.info(f"Sweep interval: {len(candidate_ids)} potentially stuck documents")
+                    for doc_id in candidate_ids:
+                        requeue_document(engine, doc_id, threshold_time)
+
+                # Heartbeat upsert is now safely inside the active session
+                session.execute(text(
+                    """
+                    INSERT INTO system_heartbeats (service_name, last_seen_at) 
+                    VALUES ('supervisor', NOW()) 
+                    ON CONFLICT (service_name) 
+                    DO UPDATE SET last_seen_at = NOW();
+                    """
+                ))
+                session.commit()
                 
-            if candidate_ids:
-                logger.info(f" Sweep interval {len(candidate_ids)} potentially stucck documents ")
-                
-            for doc_id in candidate_ids:
-                requeue_document(engine, doc_id,threshold_time)
-                
+                # Prometheus Gauge update
+                LAST_SUPERVISOR_SWEEP_TIMESTAMP.set_to_current_time()
+
         except Exception as e:
-            logger.error(f"Sweep iteration failed : {e}")
-            
+            logger.error(f"Sweep iteration failed: {e}")
+        
         time.sleep(SWEEP_INTERVAL)
         
 if __name__ == "__main__":

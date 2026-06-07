@@ -1,11 +1,15 @@
+import uuid
 import json
 import pika
 from sqlalchemy import create_engine
+import logging
 from sqlalchemy.orm import sessionmaker
-
+from telemetry import correlation_id_var , setup_logging
 from config import settings
 from processor import process_PARSED, process_embedding
 
+
+logger = logging.getLogger(__name__)
 
 engine = create_engine(
     settings.DATABASE_URL,
@@ -15,11 +19,17 @@ engine = create_engine(
 )
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
+
+
 def message_callback(ch, method, properties, body):
     """
     Main orchestrator callback. Parses incoming messages, dispatches them 
     through the pipeline checkpoints, and issues protocol ACKs/NACKs.
     """
+    trace_id = properties.correlation_id or str(uuid.uuid4())
+    token = correlation_id_var.set(trace_id)
+    
+    
     session = SessionLocal()
     try:
         # Deserialize payload
@@ -27,25 +37,25 @@ def message_callback(ch, method, properties, body):
         document_id = payload.get("documentId")
         
         if not document_id:
-            print("[Worker] Invalid payload: Missing 'document_id'. Rejecting message.")
+            logger.warning("Invalid payload: Missing 'document_id'. Rejecting message.")
             ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
             return
 
-        print(f"[Worker] Received processing request for Document: {document_id}")
+        logger.info(f"Received processing request for Document: {document_id}")
 
         #  PARSED
         parse_signal = process_PARSED(session, document_id)
         
         if parse_signal == "NACK":
-            print(f"[Worker] Transient error in PARSED for {document_id}. Requeueing.")
+            logger.warning(f"Transient error in PARSED for {document_id}. Requeueing.")
             ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
             return
         elif parse_signal == "FAILED":
-            print(f"[Worker] Terminal error in PARSED for {document_id}. Rejecting.")
+            logger.error(f"Terminal error in PARSED for {document_id}. Rejecting.")
             ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
             return
         elif parse_signal in ["SKIP_CLAIMED", "SKIP_STATE"]:
-            print(f"[Worker] Checkpoint skip signal ({parse_signal}) for {document_id}. Acknowledging.")
+            logger.info(f"Checkpoint skip signal ({parse_signal}) for {document_id}. Acknowledging.")
             ch.basic_ack(delivery_tag=method.delivery_tag)
             return
 
@@ -53,30 +63,34 @@ def message_callback(ch, method, properties, body):
         embed_signal = process_embedding(session, document_id)
         
         if embed_signal == "FAILED":
-            print(f"[Worker] Terminal error in embedding for {document_id}. Rejecting.")
+            logger.error(f" Terminal error in embedding for {document_id}. Rejecting.")
             ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
             return
         elif embed_signal == "SKIP_STATE":
-            print(f"[Worker] Document {document_id} already processed or skipped. Acknowledging.")
+            logger.info(f" Document {document_id} already processed or skipped. Acknowledging.")
             ch.basic_ack(delivery_tag=method.delivery_tag)
             return
 
-        print(f"[Worker] Document {document_id} successfully parsed and embedded.")
+        logger.info(f" Document {document_id} successfully parsed and embedded.")
         ch.basic_ack(delivery_tag=method.delivery_tag)
 
     except json.JSONDecodeError:
-        print("[Worker] Failed to decode message JSON. Rejecting bad payload.")
+        logger.error(" Failed to decode message JSON. Rejecting bad payload.")
         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
         
     except Exception as e:
-        print(f"[Worker] Unhandled critical exception during orchestration: {e}")
+        logger.error(f" Unhandled critical exception during orchestration: {e}")
         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
         
     finally:
         session.close()
+        correlation_id_var.reset(token)
 
 
 def main():
+    
+    setup_logging()
+    
     credentials = pika.PlainCredentials(settings.RABBITMQ_USER, settings.RABBITMQ_PASS)
     parameters = pika.ConnectionParameters(
         host=settings.RABBITMQ_HOST,
@@ -91,7 +105,7 @@ def main():
     channel.queue_declare(queue=settings.RABBITMQ_QUEUE, durable=True)
     channel.basic_qos(prefetch_count=1)
 
-    print(f"[*] Embedding Worker successfully started. Listening on queue: '{settings.RABBITMQ_QUEUE}'")
+    logger.info(f"Embedding Worker successfully started. Listening on queue: '{settings.RABBITMQ_QUEUE}'")
     
     channel.basic_consume(
         queue=settings.RABBITMQ_QUEUE,
@@ -101,7 +115,7 @@ def main():
     try:
         channel.start_consuming()
     except KeyboardInterrupt:
-        print("\n[*] Stopping worker gracefully...")
+        logger.info("Stopping worker gracefully...")
         channel.stop_consuming()
     finally:
         connection.close()

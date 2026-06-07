@@ -1,46 +1,127 @@
-# LexGuard
+# LexGuard — Legal Inference & AI Observability Control Plane
 
-A Legal Inference and AI Observability Control Plane. LexGuard ingests legal documents, chunks and embeds them into a pgvector store, and exposes a guardrailed RAG inference layer for legal question answering with full audit traceability.
+> A secure, production-grade RAG API that lets organizations search thousands 
+> of private legal documents instantly - with full observability, tenant isolation, 
+> and self-healing pipeline recovery.
 
 ---
+## Live Demo
 
-## Architecture Overview
-
-```
-HTTP Upload (Spring Boot :8080)
-    └── Cloudflare R2 (raw PDF storage)
-    └── PostgreSQL (document metadata + outbox)
-    └── RabbitMQ (async event bus)
-            └── Python Embedding Worker
-                    └── Unstructured.io (PDF parsing)
-                    └── SentenceTransformers all-MiniLM-L6-v2 (vector generation)
-                    └── pgvector HNSW index (similarity search)
-            └── Python Supervisor (ghost document recovery)
-            └── FastAPI RAG API (:8000)
+```bash
+curl -X POST http://your-deployment-url/demo/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "what are the access control requirements", "limit": 5}'
 ```
 
----
-
-## Verified Pipeline
-
-Upload a legal PDF → Spring Boot stores to R2 and writes a transactional outbox event → RabbitMQ relay delivers the message → Python worker parses, chunks, and embeds the document → pgvector stores 384-dimensional vectors under HNSW → FastAPI `/query` endpoint returns semantically ranked chunks.
-
-A healthy single-pass run completes at `version = 5`, reflecting five atomic state transitions. The supervisor sweep detects documents stuck in any non-terminal state beyond the timeout threshold and rolls them back to the last safe checkpoint automatically.
-
-Tested end-to-end on ISO 27001:2022. RAG query returning real chunks at cosine similarity score `0.6233`. Supervisor rollback verified: `EMBEDDING → PARSED` at `version = 6`.
+No API key required for the demo endpoint. Rate limited to 10 req/min per IP.
 
 ---
 
-## Quick Start (Docker Compose)
+## Architecture
+
+![Architecture](architecture/Flow.png)
+![Docker](architecture/Docker.png)
+
+### Write Path — Async Ingestion
+```
+PDF Upload → Spring Boot :8080 → Cloudflare R2 + PostgreSQL Outbox 
+→ RabbitMQ → Python Embedding Worker → pgvector HNSW Index
+```
+
+### Read Path — Secure RAG Retrieval
+```
+POST /query → SHA-256 API Key Auth → Rate Limiter (60 req/min per tenant) 
+→ Input Sanitization → retrieval.py → pgvector Cosine Search → Ranked Chunks
+```
+
+### Self-Healing — Supervisor Recovery
+```
+Supervisor sweeps every 60s → detects stuck documents 
+→ staged rollback (EMBEDDING→PARSED→UPLOADED) → requeues for processing
+```
+
+---
+
+## Benchmarks
+
+| Metric | Value |
+|---|---|
+| Chunks embedded | 148 vectors (all-MiniLM-L6-v2, 384 dimensions) |
+| RAG retrieval score | 0.6233 cosine similarity |
+| pgvector p99 latency (idle) | 0.18s |
+| pgvector p99 latency (concurrent) | 0.48s |
+| Supervisor recovery time | EMBEDDING→PARSED in <1s per document |
+| Pipeline completion | version = 5 (5 atomic state transitions) |
+| Supervisor rollback verified | EMBEDDING→PARSED at version = 6 |
+
+---
+
+## Observability Dashboard
+
+![Grafana Dashboard](docs/grafana.png)
+
+Real-time pipeline monitoring via Prometheus + Grafana:
+- pgvector p50/p95/p99 search latency histogram
+- Stuck document count with 10-minute threshold
+- RabbitMQ queue depth
+- Supervisor sweep timestamp
+
+---
+
+## Key Engineering Decisions
+
+**Transactional Outbox over direct RabbitMQ publish**
+The Java service atomically writes to both `documents` and `outbox_messages` 
+in a single database transaction. A scheduled relay polls with 
+`FOR UPDATE SKIP LOCKED` for safe multi-pod concurrency. Guarantees 
+exactly-once delivery without Kafka. Upload returns `202 Accepted` only 
+after the document is durably stored.
+
+**Per-document isolated sessions in supervisor**
+Each ghost document recovery runs in its own SQLAlchemy session with 
+`FOR UPDATE SKIP LOCKED`. A failure on document 50 cannot roll back 49 
+successful recoveries. Staged rollback map restores the last safe checkpoint 
+based on what processing was lost — not a blind retry.
+
+**Correlation IDs across language boundaries**
+`documentId` stamped as native AMQP `correlation_id` property (not JSON body) 
+so the Python worker reads the trace ID before deserializing the payload. 
+A poison pill message is still fully traceable. On the read path, Python 
+`contextvars` threads the `X-Correlation-ID` through every log line without 
+argument drilling. Zero fake trace IDs from Prometheus scrapers — `/metrics` 
+bypasses the correlation middleware entirely.
+
+**Optimistic locking via version column**
+`EMBEDDING` is a distributed lock state written durably to PostgreSQL before 
+the `SentenceTransformer` computation begins. If two workers race on the same 
+document, the slow worker's final commit raises `StaleDataError` and safely 
+aborts — no duplicate vectors in the store.
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Ingestion API | Java 21, Spring Boot 3.5, Flyway V1–V9 |
+| Message Queue | RabbitMQ 3 (Transactional Outbox, AMQP correlation headers) |
+| Embedding Worker | Python 3.12, SentenceTransformers (all-MiniLM-L6-v2) |
+| Vector Database | PostgreSQL 16 + pgvector (HNSW m=16, ef=128) |
+| RAG API | FastAPI, SQLAlchemy 2.0 |
+| Storage | Cloudflare R2 |
+| Security | SHA-256 API key auth, SlowAPI token bucket, prompt injection defense |
+| Observability | Prometheus, Grafana, correlation ID tracing (contextvars + AMQP) |
+| Infrastructure | Docker Compose (8 services) |
+
+---
+
+## Quick Start
 
 ### Prerequisites
-
 - Docker and Docker Compose
 - Cloudflare R2 bucket with API credentials
 
 ### Step 1 — Configure environment
-
-Create a `.env` file at the project root:
 
 ```env
 R2_ACCOUNT_ID=your_cloudflare_account_id
@@ -49,19 +130,21 @@ R2_SECRET_KEY=your_r2_secret_key
 R2_BUCKET_NAME=your_bucket_name
 ```
 
-### Step 2 — Build and start all services
+### Step 2 — Start all services
 
 ```bash
-docker compose build
-docker compose up
+docker compose up --build
 ```
 
-This starts six services: `postgres`, `rabbitmq`, `ingestion-service`, `embedding-worker`, `supervisor`, and `api`. Flyway migrations run automatically on ingestion service startup, applying V1 through V6.
+This starts 8 services: `postgres`, `rabbitmq`, `ingestion-service`, 
+`embedding-worker`, `supervisor`, `api`, `prometheus`, `grafana`.
+
+Flyway migrations V1–V9 run automatically on ingestion service startup.
 
 Wait for:
-- `lexguard-ingestion` — `Started LexGuardIngestionApplication`
-- `lexguard-api` — `Uvicorn running on http://0.0.0.0:8000`
-- `lexguard-worker` — `Embedding Worker successfully started`
+- `lexguard-ingestion` → `Started LexGuardIngestionApplication`
+- `lexguard-api` → `Uvicorn running on http://0.0.0.0:8000`
+- `lexguard-worker` → `Embedding Worker successfully started`
 
 ### Step 3 — Upload a document
 
@@ -71,24 +154,28 @@ curl -X POST http://localhost:8080/api/v1/documents \
   -F "file=@your_contract.pdf;type=application/pdf"
 ```
 
-Response:
-```json
-{
-  "documentId": "...",
-  "status": "UPLOADED",
-  "message": "Document successfully stored and queued for ML processing."
-}
-```
-
-### Step 4 — Query the document
+### Step 4 — Query (no auth required)
 
 ```bash
-curl -X POST http://localhost:8000/query \
+curl -X POST http://localhost:8000/demo/query \
   -H "Content-Type: application/json" \
-  -d '{"query": "what are the access control requirements", "limit": 3}'
+  -d '{"query": "what are the access control requirements", "limit": 5}'
 ```
 
-### Step 5 — Verify pipeline state
+### Step 5 — Monitor
+
+```bash
+# Pipeline health
+curl http://localhost:8000/health
+
+# Grafana dashboard
+open http://localhost:3000  # admin/admin
+
+# Prometheus metrics
+open http://localhost:9090
+```
+
+### Step 6 — Verify pipeline state
 
 ```bash
 docker exec lexguard-postgres psql -U admin -d lexguard \
@@ -99,83 +186,99 @@ A completed document shows `status = COMPLETED` and `version = 5`.
 
 ---
 
-## Local Development (Alternative)
+## API Reference
 
-### Prerequisites
+| Endpoint | Auth | Rate Limit | Description |
+|---|---|---|---|
+| `POST /api/v1/documents` | X-Tenant-ID header | — | Upload PDF for ingestion |
+| `POST /demo/query` | None | 10 req/min per IP | Public RAG search |
+| `POST /query` | X-API-Key | 60 req/min per tenant | Authenticated RAG search |
+| `GET /health` | None | — | Live pipeline state |
+| `GET /metrics` | None | — | Prometheus scrape endpoint |
 
-- Java 21, Maven
-- Python 3.10+
-- PostgreSQL 16 with pgvector extension
-- RabbitMQ
-
-### Spring Boot ingestion service
-
-```bash
-cd ingestion-service
-./mvnw spring-boot:run
-```
-
-Copy `src/main/resources/application-example.yml` to `application.yml` and fill in your database, RabbitMQ, and R2 credentials. Flyway applies all migrations automatically on startup.
-
-### Python worker and API
-
-```bash
-cd embedding-worker
-pip install -r requirements.txt
-python -u worker.py        # embedding worker
-python supervisor.py       # supervisor sweep
-uvicorn main:app --port 8000  # RAG API
-```
-
-Configure via environment variables matching `config.py`. The worker reads `DATABASE_URL`, `RABBITMQ_HOST`, `RABBITMQ_PORT`, `RABBITMQ_USER`, `RABBITMQ_PASS`, `RABBITMQ_QUEUE`, and the R2 credentials.
+Interactive docs: `http://localhost:8000/docs`
 
 ---
 
-## Phase 1 — Async Ingestion Pipeline (Sessions 1–4)
+## Phase 1 — Async Ingestion Pipeline 
 
-### Transactional Outbox Pattern (Session 1)
+### Transactional Outbox Pattern
 
-The Spring Boot service never publishes directly to RabbitMQ. Every document upload atomically writes to both the `documents` table and the `outbox_messages` table inside a single database transaction. A scheduled relay process polls unpublished outbox rows using `FOR UPDATE SKIP LOCKED` and publishes them to RabbitMQ, marking each row `PUBLISHED` only after the broker confirms receipt via synchronous publisher confirms.
+The Spring Boot service never publishes directly to RabbitMQ. Every document 
+upload atomically writes to both the `documents` table and the 
+`outbox_messages` table inside a single database transaction. A scheduled 
+relay polls unpublished outbox rows using `FOR UPDATE SKIP LOCKED` and 
+publishes them to RabbitMQ, marking each row `PUBLISHED` only after the 
+broker confirms receipt via synchronous publisher confirms.
 
-This guarantees no message is lost even if the broker is temporarily unavailable at upload time. The upload endpoint returns `202 Accepted` immediately, confirming the document is durably stored before any asynchronous processing begins.
+### Schema and Migrations
 
-### Schema and Migrations (Session 2)
+Flyway-managed schema with nine verified migrations (V1–V9).
 
-Flyway-managed schema with six verified migrations (V1–V6). Core tables:
+`documents` — tenant-isolated metadata with a six-state PostgreSQL enum, 
+`is_latest` flag for contract version routing, and `version` integer for 
+optimistic locking.
 
-`documents` — tenant-isolated metadata with a six-state PostgreSQL enum (`UPLOADED → PARSED → EMBEDDED → EMBEDDING → COMPLETED → FAILED`), an `is_latest` flag for contract version routing, and a `version` integer column for optimistic locking.
+`document_chunks` + `chunk_embeddings` — separated vector table with 
+`(chunk_id, model_name)` unique constraint enabling zero-downtime embedding 
+model upgrades. HNSW index at `m=16, ef_construction=128`.
 
-`document_lineage` — append-only parent/child adjacency list with a unique constraint on `parent_document_id` enforcing single-child amendment chains.
+`outbox_events` — Python-side outbox with `server_default` enforced at DDL 
+layer.
 
-`document_chunks` — layout-aware text fragments with page number and chunk type metadata for legal citation traceability.
+`system_heartbeats` — supervisor sweep timestamp for active health monitoring.
 
-`chunk_embeddings` — separated vector table with a `(chunk_id, model_name)` unique constraint enabling zero-downtime embedding model upgrades. HNSW index tuned at `m=16, ef_construction=128` for high-recall legal retrieval.
+`users` — tenant registry with SHA-256 hashed API keys, rate limit tier, 
+and `is_active` kill switch.
 
-`outbox_events` — Python-side outbox table with `server_default` enforced at the DDL layer, ensuring the `PENDING` initial state is guaranteed even for out-of-band inserts from the Java relay.
+### Python Embedding Worker
 
-### Python Embedding Worker (Session 2)
+State-driven checkpoint pipeline with `prefetch_count=1` and `heartbeat=600`:
 
-State-driven checkpoint pipeline consuming from RabbitMQ with `prefetch_count=1` and `heartbeat=600` to survive heavy CPU-bound embedding runs:
+- `processor.py` — resumable pipeline distinguishing transient failures 
+  (NACK with requeue) from terminal failures (mark FAILED, ACK to drain).
+- `worker.py` — reads `correlation_id` from AMQP envelope before 
+  deserializing payload. Poison pill messages remain traceable.
+- `supervisor.py` — per-document isolated sessions, staged rollback map, 
+  `FOR UPDATE SKIP LOCKED`, writes heartbeat to `system_heartbeats` after 
+  every sweep cycle.
 
-`models.py` — SQLAlchemy 2.0 declarative ORM with pgvector integration and `version_id_col` wired to the `documents.version` column for automatic optimistic locking.
+### RAG Retrieval
 
-`processor.py` — resumable pipeline with two independently checkpointed phases (parse, embed), distinguishing transient failures (R2 network errors, database deadlocks — NACK with requeue) from terminal failures (corrupted PDF, invalid model — mark FAILED, ACK to drain the message).
+`retrieval.py` embeds the query with `all-MiniLM-L6-v2`, executes a 
+CTE-optimised cosine similarity search, and enforces two mandatory filters: 
+`status = 'COMPLETED'` and `is_latest = true`. Distance converted to 
+similarity score via `1.0 - distance`.
 
-`worker.py` — pika consumer with explicit ACK/NACK routing mapping processor signals to RabbitMQ protocol.
+---
 
-### State Machine Hardening and Optimistic Locking (Session 3)
+## Phase 2 — Active Observability Layer 
 
-`EMBEDDING` is an explicit distributed lock state written durably to PostgreSQL before the `SentenceTransformer` computation begins. This allows the supervisor sweep to distinguish an actively processing worker from a crashed one by checking both the status column and the `updated_at` timestamp together.
+### Distributed Tracing
 
-The `version` integer column (Flyway V5) enables optimistic locking via SQLAlchemy's `version_id_col`. If a supervisor sweep re-queues a document while the original worker is still computing, the slow worker's final commit raises `StaleDataError`, which is caught and handled as `SKIP_SUPERSEDED` — the worker rolls back all pending chunk embeddings and ACKs the message without crashing or polluting the vector store.
+- **Read path:** `X-Correlation-ID` generated in FastAPI middleware, threaded 
+  through `retrieval.py` via Python `contextvars`. Zero argument drilling.
+- **Write path:** `documentId` stamped as native AMQP `correlation_id` 
+  property by the Java outbox relay. Python worker reads it from the envelope 
+  before touching the payload.
 
-### RAG Retrieval and Supervisor Sweep (Session 4)
+### Prometheus Metrics
 
-`retrieval.py` exposes a `query_documents` orchestrator that embeds the raw query text using `all-MiniLM-L6-v2`, executes a CTE-optimised cosine similarity search via pgvector, and returns typed `SearchResult` dataclasses. The query enforces two mandatory business filters: `documents.status = 'COMPLETED'` to exclude in-progress documents and `documents.is_latest = true` to exclude superseded contract versions. A configurable distance threshold (default `0.5`) acts as a noise gate. Cosine distance is converted to similarity score via `1.0 - distance` before returning to the client.
+- `pgvector_search_latency_seconds` — histogram with buckets from 1ms to 1s
+- `lexguard_stuck_document_count` — gauge updated on every `/health` call
+- `lexguard_rabbitmq_queue_depth` — gauge updated on every `/health` call  
+- `lexguard_last_supervisor_sweep_timestamp_seconds` — gauge updated on 
+  every `/health` call
 
-`supervisor.py` runs as a standalone background process on a configurable sweep interval. It detects documents stuck in any non-terminal state beyond the timeout threshold and applies a staged rollback map: `EMBEDDING → PARSED` (wipes potentially corrupted chunk data via cascade delete), `PARSED → UPLOADED` (forces full re-parse), `EMBEDDED` and `UPLOADED` remain unchanged (durable checkpoints requiring only a fresh outbox event). Each document is processed in a fully isolated SQLAlchemy session with `FOR UPDATE SKIP LOCKED` to prevent multiple supervisor instances from double-processing the same document. The sweep interval is configured at a strict fraction of the timeout threshold to avoid the temporal aliasing race where a healthy worker's document is swept mid-flight.
+### Security Layer
 
-`main.py` exposes a FastAPI `/query` endpoint with Pydantic request validation, dataclass-to-dict conversion, and two-layer exception handling distinguishing database connection failures from general pipeline errors.
+- SHA-256 API key validation against `users` table (indexed B-tree lookup)
+- SlowAPI token bucket: 60 req/min per verified tenant, 10 req/min per IP 
+  for unauthenticated endpoints
+- Input sanitization: length bounds, control character rejection, 
+  prompt injection defense (LLM control token regex)
+- Custom exception handler rewrites prompt injection `422` to `403` to 
+  avoid fingerprinting
 
 ---
 
@@ -183,29 +286,30 @@ The `version` integer column (Flyway V5) enables optimistic locking via SQLAlche
 
 ```
 LexGuard/
-├── docker-compose.yml              # Unified 6-service compose (project root)
+├── docker-compose.yml              # 8-service compose
+├── prometheus.yml                  # Prometheus scrape config
 ├── .env                            # R2 credentials (not committed)
-├── ingestion-service/              # Spring Boot 3.5 / Java 21 async ingestion API
+├── docs/
+│   ├── architecture.png            # System architecture diagram
+│   └── grafana.png                 # Observability dashboard screenshot
+├── ingestion-service/              # Spring Boot 3.5 / Java 21
 │   ├── Dockerfile
-│   ├── src/main/java/              # Controllers, services, outbox relay, R2 storage
 │   └── src/main/resources/
-│       ├── application.yml
-│       ├── application-example.yml
-│       └── db/migration/           # V1–V6 Flyway migrations
-└── embedding-worker/               # Python 3.12 async embedding pipeline
+│       └── db/migration/           # V1–V9 Flyway migrations
+└── embedding-worker/               # Python 3.12
     ├── Dockerfile
+    ├── main.py                     # FastAPI — auth, rate limit, /query, /health
+    ├── telemetry.py                # ContextVar, logging filter, Prometheus metrics
+    ├── retrieval.py                # pgvector cosine similarity search
     ├── worker.py                   # pika RabbitMQ consumer
-    ├── processor.py                # State-driven parse + embed pipeline
-    ├── supervisor.py               # Ghost document recovery sweep
-    ├── models.py                   # SQLAlchemy 2.0 ORM with pgvector + OutboxEvent
-    ├── retrieval.py                # pgvector cosine similarity search + orchestrator
-    ├── main.py                     # FastAPI /query endpoint
-    ├── config.py                   # Environment-based configuration
-    └── requirements.txt
+    ├── processor.py                # Parse + embed pipeline
+    ├── supervisor.py               # Ghost document recovery
+    ├── models.py                   # SQLAlchemy ORM + pgvector
+    └── config.py                   # Environment configuration
 ```
 
 ---
 
-## Phase 2 — Active Observability Layer (Upcoming)
-
-Phase 2 will instrument every pipeline boundary with correlation IDs, expose a Prometheus `/metrics` endpoint with query latency histograms and supervisor recovery counters, and add an active `/health` endpoint returning real-time pipeline state including stuck document counts, last sweep time, and queue depth.
+Built by Sonu Verma 
+GitHub: [Spectraa28](https://github.com/Spectraa28)
+```

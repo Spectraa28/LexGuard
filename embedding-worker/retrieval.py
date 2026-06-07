@@ -20,7 +20,7 @@ def retrieve_relevant_chunks(
     session: Session, 
     query_vector: List[float], 
     top_k: int = 5, 
-    distance_threshold: float = 0.5
+    distance_threshold: float = 0.8
 ) -> List[SearchResult]:
     """
     Executes a vector similarity search against fully processed, active legal documents

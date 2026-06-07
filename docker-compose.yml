@@ -18,6 +18,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+     - lexguard-network
 
   rabbitmq:
     image: rabbitmq:3-management-alpine
@@ -34,6 +36,8 @@ services:
       timeout: 5s
       retries: 5
       start_period: 60s
+    networks:
+      - lexguard-network
 
   ingestion-service:
     build: ./ingestion-service
@@ -57,7 +61,22 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
+    networks:
+     - lexguard-network
 
+  grafana:
+    image: grafana/grafana:latest
+    container_name: lexguard-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    depends_on:
+      - api
+    volumes:
+      - grafana_data:/var/lib/grafana
+    networks:
+      - lexguard-network
   embedding-worker:
     build: ./embedding-worker
     container_name: lexguard-worker
@@ -73,6 +92,8 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
+    networks:
+       - lexguard-network
 
   supervisor:
     build: ./embedding-worker
@@ -87,6 +108,20 @@ services:
         condition: service_healthy
       ingestion-service:
         condition: service_started
+    networks:
+     - lexguard-network
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: lexguard-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    depends_on:
+      - api  
+    networks:
+     - lexguard-network
 
   api:
     build: ./embedding-worker
@@ -94,11 +129,25 @@ services:
     command: uvicorn main:app --host 0.0.0.0 --port 8000
     ports:
       - "8000:8000"
-    environment:
-      DATABASE_URL: postgresql+psycopg2://admin:password@postgres:5432/lexguard
     depends_on:
       postgres:
         condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg2://admin:password@postgres:5432/lexguard
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_MANAGEMENT_PORT: 15672
+      RABBITMQ_USER: guest
+      RABBITMQ_PASS: guest
+    networks:
+      - lexguard-network
 
 volumes:
   postgres_data:
+  grafana_data:
+  prometheus_data:
+
+networks:
+  lexguard-network:
+    driver: bridge
