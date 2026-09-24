@@ -22,6 +22,7 @@ def run_retrieval_test():
         results = retrieve_relevant_chunks(
             session=session,
             query_vector=query_vector,
+            tenant_id=os.getenv("TEST_TENANT_ID", "demo"),
             top_k=3,
             distance_threshold=1.9
         )

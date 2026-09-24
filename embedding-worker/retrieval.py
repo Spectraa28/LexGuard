@@ -1,13 +1,20 @@
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import List, Optional ,Dict, Any
 from sqlalchemy.orm import Session
 from sqlalchemy import text ,create_engine
 from sentence_transformers import SentenceTransformer
-from config import settings
+from config import get_database_settings
+
+settings = get_database_settings()
 
 MODEL_NAME = "all-MiniLM-L6-v2"
-embedding_model = SentenceTransformer(MODEL_NAME)
 engine = create_engine(settings.DATABASE_URL, pool_pre_ping=True)
+
+
+@lru_cache
+def get_embedding_model() -> SentenceTransformer:
+    return SentenceTransformer(MODEL_NAME)
 
 @dataclass
 class SearchResult:
@@ -19,7 +26,8 @@ class SearchResult:
 def retrieve_relevant_chunks(
     session: Session, 
     query_vector: List[float], 
-    top_k: int = 5, 
+    tenant_id: str,
+    top_k: int = 5,
     distance_threshold: float = 0.8
 ) -> List[SearchResult]:
     """
@@ -41,6 +49,7 @@ def retrieve_relevant_chunks(
         JOIN documents d ON dc.document_id = d.id
         WHERE d.status = 'COMPLETED' 
           AND d.is_latest = true
+          AND d.tenant_id = :tenant_id
           AND (ce.embedding <=> query_ctx.q_vec) < :distance_threshold
         ORDER BY distance ASC
         LIMIT :top_k;
@@ -50,6 +59,7 @@ def retrieve_relevant_chunks(
         query, 
         {
             "query_vector": str(query_vector),
+            "tenant_id": tenant_id,
             "distance_threshold": distance_threshold,
             "top_k": top_k
         }
@@ -67,19 +77,20 @@ def retrieve_relevant_chunks(
     
 
 
-def query_documents(query_text: str, limit: int = 5) -> List[Dict[str, Any]]:
+def query_documents(query_text: str, tenant_id: str, limit: int = 5) -> List[Dict[str, Any]]:
     """
     The Orchestrator: Bridges the FastAPI endpoint and the database search.
     Handles text embedding, session management, and score translation.
     """
     # Mismatch 2 fix: Convert raw API text into a 384-dimensional vector
-    query_vector = embedding_model.encode(query_text).tolist()
+    query_vector = get_embedding_model().encode(query_text).tolist()
     
     # Execute the database search
     with Session(engine) as session:
         raw_results = retrieve_relevant_chunks(
             session=session,
             query_vector=query_vector,
+            tenant_id=tenant_id,
             top_k=limit
         )
         

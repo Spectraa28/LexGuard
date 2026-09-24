@@ -5,9 +5,10 @@ from sqlalchemy import create_engine
 import logging
 from sqlalchemy.orm import sessionmaker
 from telemetry import correlation_id_var , setup_logging
-from config import settings
+from config import get_worker_settings
 from processor import process_PARSED, process_embedding
 
+settings = get_worker_settings()
 
 logger = logging.getLogger(__name__)
 

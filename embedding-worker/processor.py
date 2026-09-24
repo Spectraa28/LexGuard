@@ -7,12 +7,13 @@ from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm.exc import StaleDataError
 
-from unstructured.partition.pdf import partition_pdf
-from unstructured.chunking.title import chunk_by_title
 from sentence_transformers import SentenceTransformer
 
 from models import Document, DocumentChunk,ChunkEmbedding, DocumentStatus
-from config import settings
+from config import get_worker_settings
+from pdf_parser import parse_pdf
+
+settings = get_worker_settings()
 
 s3_client = boto3.client(
     's3',
@@ -28,7 +29,7 @@ embedding_model = SentenceTransformer(MODEL_NAME)
 # PARSED 
 def process_PARSED(session: Session, document_id: str) -> str:
     """
-    Handles R2 download and unstructured chunking.
+    Handles R2 download and lightweight text-PDF chunking.
     Transition status from UPLOADED  -> PARSED -> EMBEDDING 
     """
     doc = session.get(Document, document_id)
@@ -55,8 +56,7 @@ def process_PARSED(session: Session, document_id: str) -> str:
             
         s3_client.download_file(settings.R2_BUCKET_NAME, doc.storage_key, temp_path)
             
-        elements = partition_pdf(filename=temp_path)
-        chunks = chunk_by_title(elements)
+        chunks = parse_pdf(temp_path)
         
     except (ClientError, EndpointConnectionError) as e:
         # Transient R2/Network Error -> Rollback to UPLOADED, Requeue
@@ -82,15 +82,12 @@ def process_PARSED(session: Session, document_id: str) -> str:
     try:
         db_chunks = []
         for i, chunk in enumerate(chunks):
-            page_data = getattr(chunk.metadata, 'page_number', None) if hasattr(chunk, 'metadata') else None
-            page_num = page_data[0] if isinstance(page_data, list) and page_data else page_data
-            
             db_chunk = DocumentChunk(
                 document_id=doc.id,
                 chunk_index=i,
-                page_number=page_num,
-                chunk_type=type(chunk).__name__,
-                content=str(chunk)
+                page_number=chunk.page_number,
+                chunk_type=chunk.chunk_type,
+                content=chunk.content
             )
             db_chunks.append(db_chunk)
             

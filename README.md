@@ -1,7 +1,7 @@
 # LexGuard — Legal Inference & AI Observability Control Plane
 
-> A secure, production-grade RAG API that lets organizations search thousands 
-> of private legal documents instantly - with full observability, tenant isolation, 
+> A production-inspired semantic retrieval API that lets organizations search
+> private legal documents - with observability, tenant-scoped retrieval,
 > and self-healing pipeline recovery.
 
 ---
@@ -30,8 +30,8 @@ PDF Upload → Spring Boot :8080 → Cloudflare R2 + PostgreSQL Outbox
 
 ### Read Path — Secure RAG Retrieval
 ```
-POST /query → SHA-256 API Key Auth → Rate Limiter (60 req/min per tenant) 
-→ Input Sanitization → retrieval.py → pgvector Cosine Search → Ranked Chunks
+POST /query → SHA-256 API Key Auth → Rate Limiter (60 req/min per tenant)
+→ Tenant Filter → pgvector Cosine Search → Ranked Chunks
 ```
 
 ### Self-Healing — Supervisor Recovery
@@ -136,7 +136,7 @@ R2_BUCKET_NAME=your_bucket_name
 docker compose up --build
 ```
 
-This starts 8 services: `postgres`, `rabbitmq`, `ingestion-service`, 
+This starts 8 services: `postgres`, `rabbitmq`, `ingestion-service`,
 `embedding-worker`, `supervisor`, `api`, `prometheus`, `grafana`.
 
 Flyway migrations V1–V9 run automatically on ingestion service startup.
@@ -183,6 +183,9 @@ docker exec lexguard-postgres psql -U admin -d lexguard \
 ```
 
 A completed document shows `status = COMPLETED` and `version = 5`.
+
+The lightweight worker extracts text from text-based PDFs. Scanned/image-only
+PDFs require a separate OCR worker and are rejected with a clear processing error.
 
 ---
 

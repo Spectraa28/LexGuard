@@ -1,0 +1,7 @@
+sentence-transformers==3.0.1
+psycopg2-binary==2.9.12
+SQLAlchemy==2.0.50
+pgvector==0.4.2
+python-dotenv==1.2.2
+pydantic-settings>=2.14.0
+prometheus-client==0.20.0

@@ -4,6 +4,7 @@ import hashlib
 import httpx
 import logging
 import asyncio
+import os
 from typing import List, Optional, Any, Dict
 from contextlib import asynccontextmanager
 
@@ -20,16 +21,22 @@ from sqlalchemy.exc import OperationalError
 
 from telemetry import setup_logging, correlation_id_var, track_search_latency
 from retrieval import query_documents
-from config import settings
+from config import get_database_settings
 from telemetry import STUCK_DOCUMENT_COUNT, RABBITMQ_QUEUE_DEPTH, LAST_SUPERVISOR_SWEEP_TIMESTAMP
 
 logger = logging.getLogger(__name__)
+settings = get_database_settings()
+DEMO_TENANT_ID = os.getenv("DEMO_TENANT_ID", "demo")
+RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "rabbitmq")
+RABBITMQ_MANAGEMENT_PORT = int(os.getenv("RABBITMQ_MANAGEMENT_PORT", "15672"))
+RABBITMQ_USER = os.getenv("RABBITMQ_USER", "guest")
+RABBITMQ_PASS = os.getenv("RABBITMQ_PASS", "guest")
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 class AuthenticatedUser(BaseModel):
     id: str
-    tenant_name: str
+    tenant_id: str
     rate_limit_tier: str
 
 async def get_api_key_user(
@@ -62,7 +69,7 @@ async def get_api_key_user(
 
     user = AuthenticatedUser(
         id=str(user_row[0]),
-        tenant_name=user_row[1],
+        tenant_id=user_row[1],
         rate_limit_tier=user_row[2]
     )
     request.state.user = user
@@ -71,8 +78,8 @@ async def get_api_key_user(
 
 def tenant_key_func(request: Request) -> str:
     user = getattr(request.state, "user", None)
-    if user and hasattr(user, "tenant_name"):
-        return user.tenant_name
+    if user and hasattr(user, "tenant_id"):
+        return user.tenant_id
     if request.client and request.client.host:
         return request.client.host
     return "anonymous"
@@ -186,10 +193,9 @@ async def health_check(response: Response):
 
     try:
         async with httpx.AsyncClient(timeout=2.0) as client:
-            # TODO: Move credentials to config.py
             rmq_resp = await client.get(
-                "http://rabbitmq:15672/api/queues/%2f/lexguard.document.parsing.queue",
-                auth=("guest", "guest")
+                f"http://{RABBITMQ_HOST}:{RABBITMQ_MANAGEMENT_PORT}/api/queues/%2f/lexguard.document.parsing.queue",
+                auth=(RABBITMQ_USER, RABBITMQ_PASS)
             )
             rmq_resp.raise_for_status()
             queue_depth = rmq_resp.json().get("messages", 0)
@@ -219,11 +225,11 @@ async def search_documents(
 ):
     try:
         loop = asyncio.get_running_loop()
-        # TODO: Phase 3 - pass user.tenant_name for data isolation
         matches = await loop.run_in_executor(
             None,
             query_documents,
             query_payload.query,
+            user.tenant_id,
             query_payload.limit
         )
         return QueryResponse(results=matches)
@@ -249,6 +255,7 @@ async def demo_search(request: Request, query_payload: QueryRequest):
             None,
             query_documents,
             query_payload.query,
+            DEMO_TENANT_ID,
             query_payload.limit
         )
         return QueryResponse(results=matches)
