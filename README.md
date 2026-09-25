@@ -117,6 +117,14 @@ aborts — no duplicate vectors in the store.
 
 ## Quick Start
 
+For a guided live presentation, use [`DEMO_GUIDE.md`](DEMO_GUIDE.md). For a
+concise recording, use [`VIDEO_DEMO_SCRIPT.md`](VIDEO_DEMO_SCRIPT.md). Start
+either version with the one-command launcher:
+
+```bash
+./scripts/demo.sh start
+```
+
 ### Prerequisites
 - Docker and Docker Compose
 - Cloudflare R2 bucket with API credentials
@@ -136,8 +144,9 @@ R2_BUCKET_NAME=your_bucket_name
 docker compose up --build
 ```
 
-This starts 8 services: `postgres`, `rabbitmq`, `ingestion-service`,
-`embedding-worker`, `supervisor`, `api`, `prometheus`, `grafana`.
+This starts 9 services: `frontend`, `postgres`, `rabbitmq`,
+`ingestion-service`, `embedding-worker`, `supervisor`, `api`, `prometheus`,
+and `grafana`.
 
 Flyway migrations V1–V9 run automatically on ingestion service startup.
 
@@ -145,6 +154,10 @@ Wait for:
 - `lexguard-ingestion` → `Started LexGuardIngestionApplication`
 - `lexguard-api` → `Uvicorn running on http://0.0.0.0:8000`
 - `lexguard-worker` → `Embedding Worker successfully started`
+
+Open the interactive demo control plane at `http://localhost:8088`. It includes
+bulk upload, live document progress, stuck-document detection, semantic search,
+scenario-based system checks, observability, and an interactive architecture map.
 
 ### Step 3 — Upload a document
 

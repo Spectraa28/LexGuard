@@ -1,5 +1,18 @@
 services:
 
+  frontend:
+    build: ./frontend
+    container_name: lexguard-frontend
+    ports:
+      - "8088:80"
+    depends_on:
+      api:
+        condition: service_started
+      ingestion-service:
+        condition: service_started
+    networks:
+      - lexguard-network
+
   postgres:
     image: pgvector/pgvector:pg16
     container_name: lexguard-postgres

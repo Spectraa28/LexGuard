@@ -23,6 +23,7 @@ from telemetry import setup_logging, correlation_id_var, track_search_latency
 from retrieval import query_documents
 from config import get_database_settings
 from telemetry import STUCK_DOCUMENT_COUNT, RABBITMQ_QUEUE_DEPTH, LAST_SUPERVISOR_SWEEP_TIMESTAMP
+from demo_routes import router as demo_router
 
 logger = logging.getLogger(__name__)
 settings = get_database_settings()
@@ -98,6 +99,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Lexguard Retrieval API", version="1.0", lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.include_router(demo_router)
 
 engine = create_engine(settings.DATABASE_URL)
 
