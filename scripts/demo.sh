@@ -54,7 +54,7 @@ case "$command_name" in
     wait_for_url "retrieval API" "http://localhost:8000/health"
     wait_for_url "demo UI" "http://localhost:8088"
     show_urls
-    echo "Demo is ready. Follow DEMO_GUIDE.md for the presentation flow."
+    echo "Demo is ready at http://localhost:8088."
     ;;
   status)
     docker compose ps

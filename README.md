@@ -117,9 +117,7 @@ aborts — no duplicate vectors in the store.
 
 ## Quick Start
 
-For a guided live presentation, use [`DEMO_GUIDE.md`](DEMO_GUIDE.md). For a
-concise recording, use [`VIDEO_DEMO_SCRIPT.md`](VIDEO_DEMO_SCRIPT.md). Start
-either version with the one-command launcher:
+Start the complete local demo with the one-command launcher:
 
 ```bash
 ./scripts/demo.sh start
